@@ -4,7 +4,7 @@ use fframes::ffmpeg_sys_fframes::AVPixelFormat::AV_PIX_FMT_VIDEOTOOLBOX;
 use fframes::media::FFmpegDecoder;
 use fframes::{
     AudioMap, Color, Duration, EncoderOptions, FFramesContext, FFramesRenderBackend, Frame,
-    RenderOptions, Svgr, Video, VideoEncoderInfo,
+    OutputColor, RenderOptions, Svgr, Video, VideoEncoderInfo,
 };
 use fframes_skia_renderer::metal::SkiaMetalCtx;
 use fframes_skia_renderer::{
@@ -65,6 +65,23 @@ fn center_pixel(decoder: &mut FFmpegDecoder, frame: usize) -> [u8; 4] {
     }
 }
 
+/// The video stream's matrix tag, as libavformat reads it.
+fn matrix_tag(path: &std::path::Path) -> fframes::ffmpeg_sys_fframes::AVColorSpace {
+    use fframes::ffmpeg_sys_fframes::*;
+    let name = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+    unsafe {
+        let mut input = std::ptr::null_mut();
+        assert_eq!(
+            avformat_open_input(&raw mut input, name.as_ptr(), std::ptr::null_mut(), std::ptr::null_mut()),
+            0
+        );
+        assert!(avformat_find_stream_info(input, std::ptr::null_mut()) >= 0);
+        let matrix = (*(**(*input).streams).codecpar).color_space;
+        avformat_close_input(&raw mut input);
+        matrix
+    }
+}
+
 fn assert_color_close(actual: [u8; 4], expected: [u8; 3], frame: usize) {
     // Tight enough to notice the encoder converting RGB with another matrix than the one
     // the stream is tagged with (BT.709 instead of BT.601 moves pure red by 22).
@@ -81,6 +98,7 @@ fn assert_color_close(actual: [u8; 4], expected: [u8; 3], frame: usize) {
 #[test]
 fn videotoolbox_encoders_read_the_frames_skia_rendered() {
     let metal = SkiaMetalCtx::new(TwoColors::WIDTH, TwoColors::HEIGHT).expect("a Metal device");
+    let mut ran_videotoolbox = false;
 
     let configurations = [
         (SkiaFrameExport::Auto, 1),
@@ -88,12 +106,19 @@ fn videotoolbox_encoders_read_the_frames_skia_rendered() {
         (SkiaFrameExport::GpuConversion, 1),
         (SkiaFrameExport::CpuConversion, 1),
     ];
-    for (encoder, (mode, contexts)) in ["h264_videotoolbox", "hevc_videotoolbox"]
+    // The decoder converts with the stream's tag, so a frame converted with another matrix
+    // than the tag says shows up as a colour error (see `assert_color_close`).
+    for (output_color, (encoder, (mode, contexts))) in [OutputColor::Bt601, OutputColor::Bt709]
         .into_iter()
-        .flat_map(|encoder| configurations.map(|config| (encoder, config)))
+        .flat_map(|color| {
+            ["h264_videotoolbox", "hevc_videotoolbox"]
+                .into_iter()
+                .flat_map(|encoder| configurations.map(|config| (encoder, config)))
+                .map(move |run| (color, run))
+        })
     {
         let dir = std::env::temp_dir().join(format!(
-            "fframes-skia-export-{}-{encoder}-{mode:?}-{contexts}",
+            "fframes-skia-export-{}-{encoder}-{mode:?}-{contexts}-{output_color:?}",
             std::process::id()
         ));
         std::fs::create_dir_all(&dir).unwrap();
@@ -105,6 +130,7 @@ fn videotoolbox_encoders_read_the_frames_skia_rendered() {
                 preferred_encoder: Some(encoder),
                 bitrate: Some(4_000_000),
                 codec_params: Some(&[("allow_sw", "0")]),
+                output_color,
                 ..Default::default()
             },
             ..Default::default()
@@ -147,6 +173,11 @@ fn videotoolbox_encoders_read_the_frames_skia_rendered() {
 
         fframes::render(&output, &TwoColors, backend, &options)
             .unwrap_or_else(|err| panic!("{encoder}: {err:?}"));
+        let want = match output_color {
+            OutputColor::Bt601 => fframes::ffmpeg_sys_fframes::AVColorSpace::AVCOL_SPC_SMPTE170M,
+            OutputColor::Bt709 => fframes::ffmpeg_sys_fframes::AVColorSpace::AVCOL_SPC_BT709,
+        };
+        assert_eq!(matrix_tag(&output), want, "{encoder} {mode:?} {output_color:?}: stream tag");
 
         let mut decoder = unsafe { FFmpegDecoder::new(&output, FPS, 1) }.unwrap();
         for frame in 0..FRAMES {
@@ -156,10 +187,14 @@ fn videotoolbox_encoders_read_the_frames_skia_rendered() {
                 [0, 0, 255]
             };
             assert_color_close(center_pixel(&mut decoder, frame), expected, frame);
+            ran_videotoolbox = true;
         }
         assert!(!unsafe { decoder.decode_up_to(FRAMES as i64) }.unwrap());
         drop(decoder);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+    if !ran_videotoolbox {
+        eprintln!("NOTE: no VideoToolbox encoder ran; build with `--features fframes/videotoolbox`");
     }
 }

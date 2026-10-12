@@ -797,4 +797,85 @@ mod tests {
 
         std::fs::remove_dir_all(directory).unwrap();
     }
+
+    /// The legacy `EncoderFrame` + `send_frame` path: its converter follows the encoder's
+    /// tag (BT.709 yuv420p through swscale) and the stream carries all four tags.
+    #[test]
+    fn legacy_send_frame_path_follows_output_color() {
+        for output_color in [OutputColor::Bt601, OutputColor::Bt709] {
+            let directory =
+                std::env::temp_dir().join(format!("fframes-legacy-color-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir(&directory).unwrap();
+            let path = directory.join("out.mp4");
+            let logger = make_logger(FFramesLoggerVariant::Silent);
+            let options = RenderOptions {
+                video_encoder_options: EncoderOptions {
+                    preferred_encoder: Some("libx264"),
+                    codec_params: Some(&[("threads", "1")]),
+                    output_color,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let red: Vec<u8> = [255u8, 0, 0, 255].repeat(64 * 64);
+            let luma = unsafe {
+                let encoder = Encoder::new(
+                    EncoderOutput::Final { with_audio: false },
+                    64,
+                    64,
+                    30,
+                    &path,
+                    &options,
+                    &logger,
+                )
+                .unwrap_or_else(|err| panic!("test encoder: {err}"));
+                let mut frame = EncoderFrame::new(&encoder.video_stream)
+                    .unwrap_or_else(|err| panic!("test frame: {err}"));
+                let mut luma = 0;
+                for pts in 0..4 {
+                    let converted = frame.fill_from_rgba_pixmap(&red);
+                    luma = *(*converted).data[0].add(32 * (*converted).linesize[0] as usize + 32);
+                    frame.set_pts(pts);
+                    encoder
+                        .send_frame(&encoder.video_stream, &frame)
+                        .unwrap_or_else(|err| panic!("test encode: {err}"));
+                }
+                encoder
+                    .flush_stream(&encoder.video_stream)
+                    .unwrap_or_else(|err| panic!("test drain: {err}"));
+                luma
+            };
+            // Pure red's Y: 81.5 (BT.601; the built-in converter gives 82) or 62.6 (BT.709).
+            let want = match output_color {
+                OutputColor::Bt601 => 81..=82,
+                OutputColor::Bt709 => 62..=63,
+            };
+            assert!(want.contains(&luma), "{output_color:?}: red converted to Y {luma}");
+
+            let (matrix, range, primaries, transfer) = unsafe {
+                let filename = CString::new(path.to_str().unwrap()).unwrap();
+                let mut input = std::ptr::null_mut();
+                assert_eq!(
+                    avformat_open_input(
+                        &raw mut input,
+                        filename.as_ptr(),
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut()
+                    ),
+                    0
+                );
+                assert!(avformat_find_stream_info(input, std::ptr::null_mut()) >= 0);
+                let par = &*(**(*input).streams).codecpar;
+                let tags = (par.color_space, par.color_range, par.color_primaries, par.color_trc);
+                avformat_close_input(&raw mut input);
+                tags
+            };
+            assert_eq!(
+                (matrix, range, primaries, transfer),
+                output_color.tags(),
+                "{output_color:?}: stream tags"
+            );
+            std::fs::remove_dir_all(directory).unwrap();
+        }
+    }
 }

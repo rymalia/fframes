@@ -12,6 +12,10 @@ build = "build.rs"
 name = "yuv420_conversion"
 harness = false
 
+[[bench]]
+name = "rgba_frame_converter"
+harness = false
+
 [lib]
 doctest = false
 

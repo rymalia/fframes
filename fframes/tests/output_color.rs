@@ -195,10 +195,14 @@ fn prores_frame_colors(bytes: &[u8]) -> Vec<(u8, u8, u8)> {
         .windows(4)
         .enumerate()
         .filter(|(_, w)| *w == b"icpf")
-        .map(|(i, _)| {
-            let h = &bytes[i + 4..i + 4 + 17];
-            (h[14], h[15], h[16])
+        .map(|(i, _)| &bytes[i + 4..i + 4 + 17])
+        // A real header: the frame's width and height (big-endian) at bytes 8-11, not an
+        // "icpf" that happens to be in compressed data.
+        .filter(|h| {
+            u16::from_be_bytes([h[8], h[9]]) as usize == Red::WIDTH
+                && u16::from_be_bytes([h[10], h[11]]) as usize == Red::HEIGHT
         })
+        .map(|h| (h[14], h[15], h[16]))
         .collect()
 }
 
