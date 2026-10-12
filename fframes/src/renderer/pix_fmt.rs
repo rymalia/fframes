@@ -13,6 +13,39 @@ pub const RGB_TO_YUV: [[f32; 4]; 3] = [
     [112. / 256., -94. / 256., -18. / 256., 128. / 255.],
 ];
 
+/// [`RGB_TO_YUV`] for BT.709 limited range (`OutputColor::Bt709`), from the exact matrix:
+/// Kr = 0.2126, Kb = 0.0722, Y over 219 codes from 16, Cb and Cr over 224 codes around 128.
+pub const RGB_TO_YUV_BT709: [[f32; 4]; 3] = {
+    const KR: f32 = 0.2126;
+    const KB: f32 = 0.0722;
+    const KG: f32 = 1. - KR - KB;
+    const Y: f32 = 219. / 255.;
+    const C: f32 = 224. / 255.;
+    [
+        [KR * Y, KG * Y, KB * Y, 16. / 255.],
+        [
+            -KR / (2. * (1. - KB)) * C,
+            -KG / (2. * (1. - KB)) * C,
+            0.5 * C,
+            128. / 255.,
+        ],
+        [
+            0.5 * C,
+            -KG / (2. * (1. - KR)) * C,
+            -KB / (2. * (1. - KR)) * C,
+            128. / 255.,
+        ],
+    ]
+};
+
+/// The RGB to `YCbCr` weights of `output_color`, laid out as [`RGB_TO_YUV`].
+pub const fn rgb_to_yuv(output_color: super::OutputColor) -> &'static [[f32; 4]; 3] {
+    match output_color {
+        super::OutputColor::Bt601 => &RGB_TO_YUV,
+        super::OutputColor::Bt709 => &RGB_TO_YUV_BT709,
+    }
+}
+
 #[inline(always)]
 pub fn get_rgb(pixmap: &[u8], i: usize) -> (i32, i32, i32) {
     let r = i32::from(pixmap[4 * i]);

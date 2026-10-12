@@ -7,8 +7,8 @@ use fframes::ffmpeg_sys_fframes::{
     AVVulkanFramesContext,
 };
 use fframes::{
-    AvBuffer, EncoderInput, FFramesRendererError, FFramesRendererResult, VideoEncoderInfo,
-    VideoFrame,
+    AvBuffer, EncoderInput, FFramesRendererError, FFramesRendererResult, OutputColor,
+    VideoEncoderInfo, VideoFrame,
 };
 use skia_safe::gpu::{self, DirectContext};
 use skia_safe::runtime_effect::ChildPtr;
@@ -64,6 +64,7 @@ pub(crate) fn negotiate(
         AVPixelFormat::AV_PIX_FMT_VULKAN,
         AVPixelFormat::AV_PIX_FMT_NV12,
         (encoder.width, encoder.height),
+        encoder.options.output_color,
         |_| {},
     )
     .ok()?;
@@ -85,6 +86,7 @@ struct Plane {
     extent: vk::Extent3D,
     channels: (Channel, Option<Channel>),
     subsampling: f32,
+    output_color: OutputColor,
 }
 
 impl Plane {
@@ -94,6 +96,7 @@ impl Plane {
         (width, height): (i32, i32),
         channels: (Channel, Option<Channel>),
         subsampling: f32,
+        output_color: OutputColor,
     ) -> FFramesRendererResult<Self> {
         let mut surface = gpu::surfaces::render_target(
             gpu,
@@ -120,6 +123,7 @@ impl Plane {
             },
             channels,
             subsampling,
+            output_color,
         })
     }
 
@@ -141,9 +145,11 @@ impl Plane {
             )
             .ok_or_else(|| skia_error("can not sample the rendered frame"))?;
 
-        let (first_weights, first_offset) = self.channels.0.weights();
-        let (second_weights, second_offset) =
-            self.channels.1.map_or(([0.; 4], 0.), Channel::weights);
+        let (first_weights, first_offset) = self.channels.0.weights(self.output_color);
+        let (second_weights, second_offset) = self
+            .channels
+            .1
+            .map_or(([0.; 4], 0.), |channel| channel.weights(self.output_color));
         let uniforms = super::pack_uniforms(
             effect,
             &[
@@ -266,6 +272,7 @@ impl VulkanFrameTarget {
             (width, height),
             (Channel::Y, None),
             1.,
+            input.output_color,
         )?;
         let chroma = Plane::new(
             &mut gpu,
@@ -273,6 +280,7 @@ impl VulkanFrameTarget {
             (width / 2, height / 2),
             (Channel::U, Some(Channel::V)),
             2.,
+            input.output_color,
         )?;
         let effect = RuntimeEffect::make_for_shader(PLANE_SHADER, None)
             .map_err(|err| FFramesRendererError::Skia(format!("plane shader: {err}")))?;

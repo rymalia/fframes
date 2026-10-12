@@ -1,4 +1,4 @@
-use super::encoder::EncoderOptions;
+use super::encoder::{EncoderOptions, OutputColor};
 use super::renderer_error::{
     FFramesRendererError, FFramesRendererResult, RenderEncodingError, RenderEncodingResult,
 };
@@ -325,15 +325,19 @@ pub struct EncoderInput {
     pub hw_frames_ctx: Option<AvBuffer>,
     /// `AVCodecContext::hw_device_ctx` for encoders that want the device only.
     pub hw_device_ctx: Option<AvBuffer>,
+    /// The matrix every RGB to YUV conversion of the render uses, and the tags the encoder
+    /// writes (`EncoderOptions::output_color`).
+    pub output_color: OutputColor,
 }
 
 impl EncoderInput {
     /// Frames with pixels in memory.
-    pub fn software(pixel_format: AVPixelFormat) -> Self {
+    pub fn software(pixel_format: AVPixelFormat, output_color: OutputColor) -> Self {
         Self {
             pixel_format,
             hw_frames_ctx: None,
             hw_device_ctx: None,
+            output_color,
         }
     }
 
@@ -343,7 +347,7 @@ impl EncoderInput {
         if !encoder.supports(format) {
             return Err(RenderEncodingError::InvalidPixFmt(format));
         }
-        Ok(Self::software(format))
+        Ok(Self::software(format, encoder.options.output_color))
     }
 
     /// Hardware frames of `format` holding `sw_format` pixels, allocated by libav on `device`
@@ -356,6 +360,7 @@ impl EncoderInput {
         format: AVPixelFormat,
         sw_format: AVPixelFormat,
         (width, height): (i32, i32),
+        output_color: OutputColor,
         configure: impl FnOnce(&mut AVHWFramesContext),
     ) -> RenderEncodingResult<Self> {
         unsafe {
@@ -378,6 +383,7 @@ impl EncoderInput {
                 pixel_format: format,
                 hw_frames_ctx: Some(frames),
                 hw_device_ctx: None,
+                output_color,
             })
         }
     }
@@ -551,7 +557,7 @@ impl Drop for FramePool {
 }
 
 /// Converts RGBA8 pixels into frames of a software pixel format on the CPU: the built-in
-/// SIMD converter for yuv420p, swscale for every other format.
+/// SIMD converter for BT.601 yuv420p, swscale for every other format and for BT.709.
 pub struct RgbaFrameConverter {
     pool: FramePool,
     sws: *mut SwsContext,
@@ -560,7 +566,19 @@ pub struct RgbaFrameConverter {
 unsafe impl Send for RgbaFrameConverter {}
 
 impl RgbaFrameConverter {
+    /// BT.601 output, see [`Self::with_color`].
     pub fn new(format: AVPixelFormat, width: i32, height: i32) -> RenderEncodingResult<Self> {
+        Self::with_color(format, width, height, OutputColor::Bt601)
+    }
+
+    /// YUV formats get `output_color`'s matrix, limited range; RGB formats ignore it.
+    /// BT.709 yuv420p goes through swscale: the built-in converter is BT.601 only.
+    pub fn with_color(
+        format: AVPixelFormat,
+        width: i32,
+        height: i32,
+        output_color: OutputColor,
+    ) -> RenderEncodingResult<Self> {
         if is_hardware_pixel_format(format) {
             return Err(RenderEncodingError::Internal(format!(
                 "RGBA pixels can not be converted into {format:?} hardware frames"
@@ -568,7 +586,7 @@ impl RgbaFrameConverter {
         }
 
         let pool = FramePool::new(format, width, height)?;
-        let sws = if format == AVPixelFormat::AV_PIX_FMT_YUV420P {
+        let sws = if format == AVPixelFormat::AV_PIX_FMT_YUV420P && output_color == OutputColor::Bt601 {
             std::ptr::null_mut()
         } else {
             let sws = unsafe {
@@ -590,6 +608,12 @@ impl RgbaFrameConverter {
                     "Can not allocate sws".to_owned(),
                 ));
             }
+            if output_color != OutputColor::Bt601 && is_yuv_pixel_format(format) {
+                if let Err(err) = unsafe { set_sws_output_matrix(sws, output_color) } {
+                    unsafe { sws_freeContext(sws) };
+                    return Err(err);
+                }
+            }
             sws
         };
 
@@ -598,7 +622,7 @@ impl RgbaFrameConverter {
 
     /// For the frames `input` asks for.
     pub fn for_input(input: &EncoderInput, width: i32, height: i32) -> RenderEncodingResult<Self> {
-        Self::new(input.pixel_format, width, height)
+        Self::with_color(input.pixel_format, width, height, input.output_color)
     }
 
     /// `rgba` is `width * height * 4` bytes without line padding.
@@ -648,6 +672,68 @@ impl RgbaFrameConverter {
 
         Ok(frame)
     }
+}
+
+/// A software YUV format: three or four components, none of them RGB, palette or Bayer. Gray
+/// formats (one or two components) have no chroma and no matrix to choose.
+pub(crate) fn is_yuv_pixel_format(format: AVPixelFormat) -> bool {
+    let desc = unsafe { av_pix_fmt_desc_get(format) };
+    let Some(desc) = (unsafe { desc.as_ref() }) else {
+        return false;
+    };
+    let not_yuv = (AV_PIX_FMT_FLAG_RGB | AV_PIX_FMT_FLAG_PAL | AV_PIX_FMT_FLAG_BAYER | AV_PIX_FMT_FLAG_HWACCEL) as u64;
+    desc.flags & not_yuv == 0 && desc.nb_components >= 3
+}
+
+/// Makes `sws` (RGB in, YUV out) write `output_color`'s matrix in limited range. swscale's
+/// default output table is BT.601; the input side (RGB, full range) is left as it is.
+pub(crate) unsafe fn set_sws_output_matrix(
+    sws: *mut SwsContext,
+    output_color: OutputColor,
+) -> RenderEncodingResult<()> {
+    let coefficients = match output_color {
+        OutputColor::Bt601 => SWS_CS_ITU601,
+        OutputColor::Bt709 => SWS_CS_ITU709,
+    };
+    unsafe {
+        let mut inv_table: *mut i32 = std::ptr::null_mut();
+        let mut table: *mut i32 = std::ptr::null_mut();
+        let (mut src_range, mut dst_range) = (0, 0);
+        let (mut brightness, mut contrast, mut saturation) = (0, 0, 0);
+        let status = sws_getColorspaceDetails(
+            sws,
+            &raw mut inv_table,
+            &raw mut src_range,
+            &raw mut table,
+            &raw mut dst_range,
+            &raw mut brightness,
+            &raw mut contrast,
+            &raw mut saturation,
+        );
+        if status < 0 {
+            return Err(RenderEncodingError::Internal(format!(
+                "swscale has no colour details for the output: {}",
+                av_error_to_string(status)
+            )));
+        }
+        let status = sws_setColorspaceDetails(
+            sws,
+            inv_table,
+            src_range,
+            sws_getCoefficients(coefficients as i32),
+            0, // limited range
+            brightness,
+            contrast,
+            saturation,
+        );
+        if status < 0 {
+            return Err(RenderEncodingError::Internal(format!(
+                "swscale refused the {output_color:?} output matrix: {}",
+                av_error_to_string(status)
+            )));
+        }
+    }
+    Ok(())
 }
 
 impl Drop for RgbaFrameConverter {

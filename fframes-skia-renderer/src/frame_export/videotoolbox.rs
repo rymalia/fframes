@@ -7,8 +7,8 @@ use core_foundation::number::CFNumber;
 use core_foundation::string::{CFString, CFStringRef};
 use fframes::ffmpeg_sys_fframes::{AVHWDeviceType, AVPixelFormat, av_buffer_create};
 use fframes::{
-    AvBuffer, EncoderInput, FFramesRendererError, FFramesRendererResult, VideoEncoderInfo,
-    VideoFrame,
+    AvBuffer, EncoderInput, FFramesRendererError, FFramesRendererResult, OutputColor,
+    VideoEncoderInfo, VideoFrame,
 };
 use skia_safe::gpu::{self, DirectContext, SurfaceOrigin, backend_render_targets, mtl};
 use skia_safe::{ColorType, Surface};
@@ -36,6 +36,7 @@ unsafe extern "C" {
     static kCVMetalTextureUsage: CFStringRef;
     static kCVImageBufferYCbCrMatrixKey: CFStringRef;
     static kCVImageBufferYCbCrMatrix_ITU_R_601_4: CFStringRef;
+    static kCVImageBufferYCbCrMatrix_ITU_R_709_2: CFStringRef;
 
     fn CVBufferSetAttachment(
         buffer: CVPixelBufferRef,
@@ -109,6 +110,7 @@ pub(crate) fn negotiate(
         AVPixelFormat::AV_PIX_FMT_VIDEOTOOLBOX,
         AVPixelFormat::AV_PIX_FMT_BGRA,
         (encoder.width, encoder.height),
+        encoder.options.output_color,
         |_| {},
     )
     .ok()?;
@@ -152,6 +154,7 @@ pub(crate) struct VideoToolboxFrameTarget {
     frames: AvBuffer,
     width: i32,
     height: i32,
+    output_color: OutputColor,
 }
 
 impl VideoToolboxFrameTarget {
@@ -246,6 +249,7 @@ impl VideoToolboxFrameTarget {
                 frames: frames.clone(),
                 width,
                 height,
+                output_color: input.output_color,
             },
         ))
     }
@@ -270,12 +274,17 @@ impl VideoToolboxFrameTarget {
 
             // FFmpeg passes hardware pixel buffers through unchanged. The session's
             // YCbCrMatrix property tags the stream, but does not choose the RGB input
-            // conversion matrix without this attachment. Match the BT.601 stream tag
-            // and the software/GPU YUV converters instead of VideoToolbox's HD default.
+            // conversion matrix without this attachment. Match the stream tag and the
+            // software/GPU YUV converters (`output_color`) instead of VideoToolbox's
+            // HD default.
+            let matrix = match self.output_color {
+                OutputColor::Bt601 => kCVImageBufferYCbCrMatrix_ITU_R_601_4,
+                OutputColor::Bt709 => kCVImageBufferYCbCrMatrix_ITU_R_709_2,
+            };
             CVBufferSetAttachment(
                 pixel_buffer,
                 kCVImageBufferYCbCrMatrixKey,
-                kCVImageBufferYCbCrMatrix_ITU_R_601_4.cast(),
+                matrix.cast(),
                 1, // kCVAttachmentMode_ShouldPropagate
             );
 

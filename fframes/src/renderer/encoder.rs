@@ -78,6 +78,75 @@ pub fn av_error_to_string(errnum: i32) -> String {
     }
 }
 
+/// Colour of an encoded YUV video stream: the matrix and range fframes converts its RGB frames
+/// with, and the colour tags it writes. Ignored for RGB pixel formats.
+///
+/// fframes draws in RGB and converts only the matrix and range, never primaries or transfer:
+/// pick the profile of the video the graphics are delivered in (BT.709 for HD).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum OutputColor {
+    /// BT.601 limited range, tagged `smpte170m`, with primaries and transfer left
+    /// unspecified (fframes' RGB has no BT.601 primaries).
+    #[default]
+    Bt601,
+    /// BT.709 limited range, tagged `bt709` for matrix, primaries and transfer.
+    Bt709,
+}
+
+impl OutputColor {
+    /// The matrix, range, primaries and transfer to tag the stream and its frames with.
+    pub fn tags(
+        self,
+    ) -> (
+        AVColorSpace,
+        AVColorRange,
+        AVColorPrimaries,
+        AVColorTransferCharacteristic,
+    ) {
+        match self {
+            Self::Bt601 => (
+                AVColorSpace::AVCOL_SPC_SMPTE170M,
+                AVColorRange::AVCOL_RANGE_MPEG,
+                AVColorPrimaries::AVCOL_PRI_UNSPECIFIED,
+                AVColorTransferCharacteristic::AVCOL_TRC_UNSPECIFIED,
+            ),
+            Self::Bt709 => (
+                AVColorSpace::AVCOL_SPC_BT709,
+                AVColorRange::AVCOL_RANGE_MPEG,
+                AVColorPrimaries::AVCOL_PRI_BT709,
+                AVColorTransferCharacteristic::AVCOL_TRC_BT709,
+            ),
+        }
+    }
+}
+
+/// Copies the encoder's colour tags onto `frame` wherever the frame leaves them unspecified.
+/// Some encoders write the frame's fields rather than the context's: `prores_ks` puts the
+/// frame's primaries, transfer and matrix into every frame header, so untagged frames gave
+/// untagged ProRes. Pool frames are reused, so this runs on every send.
+///
+/// # Safety
+/// `enc` must be a valid codec context and `frame` a valid frame or null.
+unsafe fn tag_frame_color(enc: *const AVCodecContext, frame: *mut AVFrame) {
+    unsafe {
+        let (Some(enc), Some(frame)) = (enc.as_ref(), frame.as_mut()) else {
+            return;
+        };
+        if frame.colorspace == AVColorSpace::AVCOL_SPC_UNSPECIFIED {
+            frame.colorspace = enc.colorspace;
+        }
+        if frame.color_range == AVColorRange::AVCOL_RANGE_UNSPECIFIED {
+            frame.color_range = enc.color_range;
+        }
+        if frame.color_primaries == AVColorPrimaries::AVCOL_PRI_UNSPECIFIED {
+            frame.color_primaries = enc.color_primaries;
+        }
+        if frame.color_trc == AVColorTransferCharacteristic::AVCOL_TRC_UNSPECIFIED {
+            frame.color_trc = enc.color_trc;
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct EncoderOptions<'a> {
     /// Force the codec to be used for encoding audio/video stream. If not provided the codec will
@@ -155,6 +224,9 @@ pub struct EncoderOptions<'a> {
     /// let video_tag = MKTAG!('h', 'v', 'c', '1');
     /// ```
     pub tag: Option<isize>,
+    /// Colour matrix, range and tags of the encoded video stream.
+    /// @default `OutputColor::Bt601`
+    pub output_color: OutputColor,
 }
 
 impl EncoderOptions<'_> {
@@ -218,6 +290,7 @@ impl Default for EncoderOptions<'_> {
             sample_format: AVSampleFormat::AV_SAMPLE_FMT_FLTP,
             sample_rate: 44100,
             tag: None,
+            output_color: OutputColor::Bt601,
         }
     }
 }
@@ -285,7 +358,10 @@ impl Encoder {
                 fps,
                 filename,
                 render_options,
-                &EncoderInput::software(render_options.video_encoder_options.pixel_format),
+                &EncoderInput::software(
+                    render_options.video_encoder_options.pixel_format,
+                    render_options.video_encoder_options.output_color,
+                ),
                 logger,
             )
         }
@@ -395,6 +471,7 @@ impl Encoder {
         customize_frame: F,
     ) -> RenderEncodingResult<()> {
         unsafe {
+            tag_frame_color(stream.enc, frame);
             let mut status = avcodec_send_frame(stream.enc, frame);
 
             if status < 0 {

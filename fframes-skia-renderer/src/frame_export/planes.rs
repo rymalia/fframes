@@ -1,8 +1,8 @@
 use fframes::ffmpeg_sys_fframes::AVPixelFormat::{self, *};
-use fframes::pix_fmt::RGB_TO_YUV;
+use fframes::pix_fmt::rgb_to_yuv;
 use fframes::{
-    FFramesRendererError, FFramesRendererResult, FrameLayout, FramePool, RenderEncodingError,
-    VideoFrame,
+    FFramesRendererError, FFramesRendererResult, FrameLayout, FramePool, OutputColor,
+    RenderEncodingError, VideoFrame,
 };
 use skia_safe::runtime_effect::ChildPtr;
 use skia_safe::{
@@ -20,10 +20,10 @@ pub(crate) enum Channel {
 }
 
 impl Channel {
-    /// `([r, g, b, a], offset)`
-    pub(crate) fn weights(self) -> ([f32; 4], f32) {
+    /// `([r, g, b, a], offset)` for the matrix of `output_color`.
+    pub(crate) fn weights(self, output_color: OutputColor) -> ([f32; 4], f32) {
         let yuv = |row: usize| {
-            let [r, g, b, offset] = RGB_TO_YUV[row];
+            let [r, g, b, offset] = rgb_to_yuv(output_color)[row];
             ([r, g, b, 0.], offset)
         };
 
@@ -226,6 +226,7 @@ pub(crate) struct PlaneExporter {
     effect: RuntimeEffect,
     packing: Packing,
     pool: FramePool,
+    output_color: OutputColor,
 }
 
 impl PlaneExporter {
@@ -235,9 +236,10 @@ impl PlaneExporter {
         format: AVPixelFormat,
         width: i32,
         height: i32,
+        output_color: OutputColor,
     ) -> Option<FFramesRendererResult<Self>> {
         let specs = plane_specs(format)?;
-        Some(Self::with_specs(gpu, format, specs, width, height))
+        Some(Self::with_specs(gpu, format, specs, width, height, output_color))
     }
 
     fn with_specs(
@@ -246,6 +248,7 @@ impl PlaneExporter {
         specs: &[PlaneSpec],
         width: i32,
         height: i32,
+        output_color: OutputColor,
     ) -> FFramesRendererResult<Self> {
         let packing = Packing::new(specs, width, height);
 
@@ -278,16 +281,19 @@ impl PlaneExporter {
             effect,
             packing,
             pool,
+            output_color,
         })
     }
 
     fn uniforms(&self, plane: &PlacedPlane) -> FFramesRendererResult<Data> {
-        let (even_weights, even_offset) = plane.spec.channels.0.weights();
+        let (even_weights, even_offset) = plane.spec.channels.0.weights(self.output_color);
         let (odd_weights, odd_offset) = plane
             .spec
             .channels
             .1
-            .map_or((even_weights, even_offset), Channel::weights);
+            .map_or((even_weights, even_offset), |channel| {
+                channel.weights(self.output_color)
+            });
 
         super::pack_uniforms(
             &self.effect,

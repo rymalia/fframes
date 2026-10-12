@@ -1,3 +1,5 @@
+use super::OutputColor;
+use super::frame_export::{is_yuv_pixel_format, set_sws_output_matrix};
 use super::renderer_error::{RenderEncodingError, RenderEncodingResult};
 use super::stream;
 use crate::ffmpeg_action;
@@ -12,7 +14,12 @@ pub(crate) struct FrameFormatConvertor {
 }
 
 impl FrameFormatConvertor {
-    pub(crate) unsafe fn new(video_stream: &stream::Stream) -> RenderEncodingResult<Self> {
+    /// Converts with the matrix the encoder is tagged with (`stream.rs` tags it from
+    /// `OutputColor`), so the legacy `EncoderFrame` path matches its tags.
+    pub(crate) unsafe fn new(
+        video_stream: &stream::Stream,
+        output_color: OutputColor,
+    ) -> RenderEncodingResult<Self> {
         unsafe {
             let sws_ctx = sws_getContext(
                 (*video_stream.enc).width,
@@ -31,6 +38,13 @@ impl FrameFormatConvertor {
                 return Err(RenderEncodingError::Internal(
                     "Can not allocate sws".to_owned(),
                 ));
+            }
+            if output_color != OutputColor::Bt601
+                && is_yuv_pixel_format((*video_stream.enc).pix_fmt)
+                && let Err(err) = set_sws_output_matrix(sws_ctx, output_color)
+            {
+                sws_freeContext(sws_ctx);
+                return Err(err);
             }
 
             let tmp_frame = av_frame_alloc();
@@ -101,8 +115,14 @@ impl EncoderFrame {
                     (*frame).width = (*stream.enc).width;
                     (*frame).height = (*stream.enc).height;
 
-                    format_convertor = ((*stream.enc).pix_fmt != AVPixelFormat::AV_PIX_FMT_YUV420P)
-                        .then(|| FrameFormatConvertor::new(stream))
+                    // The built-in yuv420p converter is BT.601 only.
+                    let output_color = match (*stream.enc).colorspace {
+                        AVColorSpace::AVCOL_SPC_BT709 => OutputColor::Bt709,
+                        _ => OutputColor::Bt601,
+                    };
+                    format_convertor = ((*stream.enc).pix_fmt != AVPixelFormat::AV_PIX_FMT_YUV420P
+                        || output_color != OutputColor::Bt601)
+                        .then(|| FrameFormatConvertor::new(stream, output_color))
                         .transpose()?;
                 }
                 stream::StreamVariant::Audio(_) => {

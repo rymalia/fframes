@@ -57,7 +57,10 @@ impl<'a, 'o, 'm> SegmentWriter<'a, 'o, 'm> {
             fps,
             render_options,
             logger,
-            input: EncoderInput::software(render_options.video_encoder_options.pixel_format),
+            input: EncoderInput::software(
+                render_options.video_encoder_options.pixel_format,
+                render_options.video_encoder_options.output_color,
+            ),
             open: Mutex::new(HashMap::new()),
             finished: Mutex::new(Vec::new()),
         }

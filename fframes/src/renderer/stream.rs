@@ -179,15 +179,19 @@ pub(crate) unsafe fn open_video_encoder(
         if let Some(device) = &input.hw_device_ctx {
             (*c).hw_device_ctx = device.new_ref();
         }
-        // Every RGBA to YUV path (the built-in yuv420 converter, swscale's
-        // default and the GPU converters of the backends) produces BT.601
+        // Every RGBA to YUV path (the built-in yuv420 converter, swscale and the
+        // GPU converters of the backends) converts with `input.output_color`,
         // limited range. Say so: an untagged HD stream is decoded as BT.709,
         // shifting colors. Hardware encoders that are fed RGB surfaces
-        // convert with the matrix they are told here.
+        // convert with the matrix they are told here. `send_raw_frame` copies
+        // these onto every frame too, for encoders that read the frame's.
         let pix_fmt_desc = av_pix_fmt_desc_get(input.pixel_format);
         if !pix_fmt_desc.is_null() && (*pix_fmt_desc).flags & AV_PIX_FMT_FLAG_RGB as u64 == 0 {
-            (*c).color_range = AVColorRange::AVCOL_RANGE_MPEG;
-            (*c).colorspace = AVColorSpace::AVCOL_SPC_SMPTE170M;
+            let (matrix, range, primaries, transfer) = input.output_color.tags();
+            (*c).color_range = range;
+            (*c).colorspace = matrix;
+            (*c).color_primaries = primaries;
+            (*c).color_trc = transfer;
         }
         (*c).gop_size = encoder_options.gop_size;
         (*c).qmin = encoder_options.qmin;
