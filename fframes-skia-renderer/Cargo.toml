@@ -44,8 +44,6 @@ default = ["gpu", "binary-cache"]
 binary-cache = ["skia-safe/binary-cache"]
 gpu = ["skia-safe/ganesh"]
 metal = ["gpu", "skia-safe/metal", "metal-rs", "dep:core-foundation"]
-# Lets integration tests distinguish an enabled VideoToolbox build from one that cannot run it.
-videotoolbox = ["fframes/videotoolbox"]
 vulkan = ["gpu", "skia-safe/vulkan", "ash"]
 # Share the Vulkan device with FFmpeg, so Vulkan Video encoders (h264_vulkan, hevc_vulkan)
 # read the frames on the GPU. Builds FFmpeg with Vulkan support.

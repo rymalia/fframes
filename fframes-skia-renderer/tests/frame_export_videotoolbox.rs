@@ -10,6 +10,7 @@ use fframes_skia_renderer::metal::SkiaMetalCtx;
 use fframes_skia_renderer::{
     SkiaFFramesRenderer, SkiaFrameExport, SkiaPipelineConcurrencyPolicy, SkiaPipelineConfig,
 };
+use std::ffi::CStr;
 
 const FPS: usize = 60;
 // Three 40-frame segments end at fractional seconds and expose truncated MP4 edit lists.
@@ -194,10 +195,23 @@ fn videotoolbox_encoders_read_the_frames_skia_rendered() {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
-    #[cfg(feature = "videotoolbox")]
-    assert!(ran_videotoolbox, "VideoToolbox is enabled but no VideoToolbox encoder ran");
-    #[cfg(not(feature = "videotoolbox"))]
-    if !ran_videotoolbox {
+    let videotoolbox_enabled = unsafe {
+        let configuration = fframes::ffmpeg_sys_fframes::avcodec_configuration();
+        !configuration.is_null()
+            && CStr::from_ptr(configuration)
+                .to_string_lossy()
+                .contains("--enable-videotoolbox")
+    };
+    assert!(
+        !ran_videotoolbox || videotoolbox_enabled,
+        "a VideoToolbox encoder ran but linked FFmpeg does not report VideoToolbox enabled"
+    );
+    if videotoolbox_enabled {
+        assert!(
+            ran_videotoolbox,
+            "linked FFmpeg enables VideoToolbox but no VideoToolbox encoder ran"
+        );
+    } else if !ran_videotoolbox {
         eprintln!("NOTE: no VideoToolbox encoder ran; build with `--features fframes/videotoolbox`");
     }
 }
