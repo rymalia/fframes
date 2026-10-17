@@ -8,15 +8,17 @@
 use fframes::ffmpeg_sys_fframes::AVPixelFormat::{self, *};
 use fframes::ffmpeg_sys_fframes::*;
 use fframes::{
-    AudioMap, Color, Duration, EncoderOptions, FFramesContext, Frame, OutputColor, RenderOptions,
-    Svgr, Video,
+    AudioMap, Color, Duration, EncoderOptions, FFramesContext, FFramesRenderBackend, Frame,
+    OutputColor, RenderOptions, Svgr, Video,
 };
 use fframes_skia_renderer::metal::SkiaMetalCtx;
 use fframes_skia_renderer::{
-    SkiaFFramesRenderer, SkiaFrameExport, SkiaPipelineConcurrencyPolicy, SkiaPipelineConfig,
+    FrameExportPath, SkiaEncoderFrameRenderer, SkiaFFramesRenderer, SkiaFrameExport,
+    SkiaPipelineConcurrencyPolicy, SkiaPipelineConfig,
 };
 
 const SIDE: usize = 64;
+const FRAMES: usize = 48; // Two GOPs, so the rawvideo export crosses a segment boundary.
 const COLORS: [[u8; 3]; 4] = [[255, 0, 0], [0, 255, 0], [0, 0, 255], [255, 255, 0]];
 
 #[derive(Debug)]
@@ -29,7 +31,7 @@ impl Video for Swatches {
     const BACKGROUND_COLOR: Color = Color::BLACK;
 
     fn duration(&self) -> Duration<'_> {
-        Duration::Frames(COLORS.len())
+        Duration::Frames(FRAMES)
     }
 
     fn audio(&self) -> AudioMap<'_> {
@@ -37,7 +39,7 @@ impl Video for Swatches {
     }
 
     fn render_frame<'a>(&'a self, frame: Frame, _ctx: &FFramesContext<'a, '_>) -> Svgr<'a> {
-        let [r, g, b] = COLORS[frame.index];
+        let [r, g, b] = COLORS[frame.index % COLORS.len()];
         let fill = format!("#{r:02x}{g:02x}{b:02x}");
         fframes::svgr!(
             <svg xmlns="http://www.w3.org/2000/svg" width={Self::WIDTH} height={Self::HEIGHT}>
@@ -116,6 +118,17 @@ fn packets(path: &std::path::Path) -> Vec<Vec<u8>> {
     out
 }
 
+fn expected_packet_size(format: AVPixelFormat) -> usize {
+    let pixels = SIDE * SIDE;
+    match format {
+        AV_PIX_FMT_YUV420P | AV_PIX_FMT_NV12 | AV_PIX_FMT_NV21 => pixels * 3 / 2,
+        AV_PIX_FMT_YUVA420P => pixels * 5 / 2,
+        AV_PIX_FMT_YUV422P => pixels * 2,
+        AV_PIX_FMT_YUV444P => pixels * 3,
+        other => panic!("no packet-size expectation for {other:?}"),
+    }
+}
+
 #[test]
 fn plane_exports_use_the_output_color() {
     let metal = SkiaMetalCtx::new(SIDE, SIDE).expect("a Metal device");
@@ -156,16 +169,50 @@ fn plane_exports_use_the_output_color() {
                 )
                 .unwrap()
                 .frame_export(mode);
+                if mode == SkiaFrameExport::GpuConversion {
+                    let info = fframes::VideoEncoderInfo::for_output(
+                        &output,
+                        (SIDE as i32, SIDE as i32, 30),
+                        &options.video_encoder_options,
+                    )
+                    .unwrap();
+                    let input = backend.negotiate_encoder_input(&info).unwrap();
+                    let renderer = SkiaEncoderFrameRenderer::new(
+                        &metal,
+                        mode,
+                        &input,
+                        SIDE as u32,
+                        SIDE as u32,
+                    )
+                    .unwrap();
+                    assert_eq!(renderer.path(), FrameExportPath::GpuConversion, "{format:?}");
+                }
                 fframes::render(&output, &Swatches, backend, &options)
                     .unwrap_or_else(|err| panic!("{mode:?} {format:?} {output_color:?}: {err:?}"));
 
                 let frames = packets(&output);
-                assert_eq!(frames.len(), COLORS.len(), "{mode:?} {format:?}: frames");
+                assert_eq!(frames.len(), FRAMES, "{mode:?} {format:?}: frames");
+                for (index, packet) in frames.iter().enumerate() {
+                    assert_eq!(
+                        packet.len(),
+                        expected_packet_size(format),
+                        "{mode:?} {format:?}: packet {index} size"
+                    );
+                }
+                if format == AV_PIX_FMT_YUVA420P {
+                    let alpha_offset = SIDE * SIDE * 3 / 2;
+                    for (index, packet) in frames.iter().enumerate() {
+                        assert!(
+                            packet[alpha_offset..].iter().all(|alpha| *alpha == 255),
+                            "{mode:?} {format:?}: packet {index} alpha plane is not opaque"
+                        );
+                    }
+                }
                 let other = match output_color {
                     OutputColor::Bt601 => OutputColor::Bt709,
                     OutputColor::Bt709 => OutputColor::Bt601,
                 };
-                for (rgb, packet) in COLORS.iter().zip(&frames) {
+                for (rgb, packet) in COLORS.iter().cycle().take(FRAMES).zip(&frames) {
                     let got = centre_yuv(format, packet);
                     let want = exact_yuv(coefficients(output_color), *rgb);
                     let not = exact_yuv(coefficients(other), *rgb);

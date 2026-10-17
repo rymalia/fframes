@@ -194,6 +194,9 @@ fn videotoolbox_encoders_read_the_frames_skia_rendered() {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+    #[cfg(feature = "videotoolbox")]
+    assert!(ran_videotoolbox, "VideoToolbox is enabled but no VideoToolbox encoder ran");
+    #[cfg(not(feature = "videotoolbox"))]
     if !ran_videotoolbox {
         eprintln!("NOTE: no VideoToolbox encoder ran; build with `--features fframes/videotoolbox`");
     }

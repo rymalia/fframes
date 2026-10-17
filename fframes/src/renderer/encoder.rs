@@ -852,7 +852,7 @@ mod tests {
             };
             assert!(want.contains(&luma), "{output_color:?}: red converted to Y {luma}");
 
-            let (matrix, range, primaries, transfer) = unsafe {
+            let (matrix, range, primaries, transfer, packet_count) = unsafe {
                 let filename = CString::new(path.to_str().unwrap()).unwrap();
                 let mut input = std::ptr::null_mut();
                 assert_eq!(
@@ -867,14 +867,24 @@ mod tests {
                 assert!(avformat_find_stream_info(input, std::ptr::null_mut()) >= 0);
                 let par = &*(**(*input).streams).codecpar;
                 let tags = (par.color_space, par.color_range, par.color_primaries, par.color_trc);
+                let mut packet = av_packet_alloc();
+                let mut packet_count = 0;
+                while av_read_frame(input, packet) >= 0 {
+                    if (*packet).stream_index == 0 {
+                        packet_count += 1;
+                    }
+                    av_packet_unref(packet);
+                }
+                av_packet_free(&raw mut packet);
                 avformat_close_input(&raw mut input);
-                tags
+                (tags.0, tags.1, tags.2, tags.3, packet_count)
             };
             assert_eq!(
                 (matrix, range, primaries, transfer),
                 output_color.tags(),
                 "{output_color:?}: stream tags"
             );
+            assert_eq!(packet_count, 4, "{output_color:?}: encoded video packets");
             std::fs::remove_dir_all(directory).unwrap();
         }
     }

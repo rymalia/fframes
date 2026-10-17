@@ -103,6 +103,15 @@ fn bt709_weights_match_the_exact_matrix() {
 }
 
 #[test]
+fn default_encoder_pixel_format_is_yuv420p() {
+    assert_eq!(
+        EncoderOptions::default().pixel_format,
+        AV_PIX_FMT_YUV420P,
+        "the default conversion baseline assumes yuv420p"
+    );
+}
+
+#[test]
 fn converters_use_the_requested_matrix() {
     // (format, tolerance in 8-bit codes against the exact matrix). yuv420p's BT.601 path is
     // the built-in integer converter (66/129/25 weights): within 1.5 codes of exact.
@@ -195,7 +204,12 @@ fn prores_frame_colors(bytes: &[u8]) -> Vec<(u8, u8, u8)> {
         .windows(4)
         .enumerate()
         .filter(|(_, w)| *w == b"icpf")
-        .map(|(i, _)| &bytes[i + 4..i + 4 + 17])
+        .filter_map(|(i, _)| {
+            let frame_start = i.checked_sub(4)?;
+            let frame_size = u32::from_be_bytes(bytes[frame_start..i].try_into().ok()?) as usize;
+            let frame_end = frame_start.checked_add(frame_size)?;
+            (frame_size >= 25 && frame_end <= bytes.len()).then_some(&bytes[i + 4..i + 4 + 17])
+        })
         // A real header: the frame's width and height (big-endian) at bytes 8-11, not an
         // "icpf" that happens to be in compressed data.
         .filter(|h| {
