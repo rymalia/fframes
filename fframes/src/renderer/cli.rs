@@ -15,11 +15,12 @@
 //! into a `#[derive(clap::Args)]` struct: `let args = cli::parse::<MyArgs>();`, build the video
 //! from `args.app`, then `cli::new(&video, options).args(args).run()`.
 use super::{
-    CpuFrameRenderer, FFramesRenderBackend, FrameRenderer, FrameReport, Previewer, RgbaFrame,
+    CpuFrameRenderer, FFramesRenderBackend, FFramesRendererError, FrameRenderer, FrameReport,
+    Previewer, RgbaFrame,
     continuity::{PopDetector, PopKind},
     element_labels::{self, LabelledElement},
     fframes_logger::FFramesLoggerVariant,
-    sheet, snapshot,
+    sheet,
 };
 use crate::diagnostics::Severity;
 use crate::{AudioMixer, AudioTimelineSamples, AudioTimelineUnit, RenderOptions, Video};
@@ -109,8 +110,6 @@ pub enum Command {
     Timeline,
     /// Check frames for missing media and fonts, clipped text and panics without rendering.
     Inspect(InspectArgs),
-    /// Compare frames with approved PNG snapshots (visual regression).
-    Snapshot(SnapshotArgs),
     /// Render, measure and query the audio mix.
     #[command(subcommand)]
     Audio(AudioCommand),
@@ -284,6 +283,19 @@ fn check_render_size<V: Video>(scale: f64) -> CliResult<()> {
 }
 
 /// The pixels of `region` (video pixels) in a frame rendered at any scale.
+/// The file name of a time spec: `Intro@1.5s` -> `intro_1.5s`.
+fn file_name(spec: &str) -> String {
+    let name: String = spec
+        .chars()
+        .map(|c| match c {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '.' | '-' => c.to_ascii_lowercase(),
+            '%' => 'p',
+            _ => '_',
+        })
+        .collect();
+    name.trim_matches('_').to_owned()
+}
+
 fn crop_frame<V: Video>(frame: &RgbaFrame, region: Region) -> RgbaFrame {
     let scale = f64::from(frame.width) / V::WIDTH as f64;
     frame.crop(
@@ -292,24 +304,6 @@ fn crop_frame<V: Video>(frame: &RgbaFrame, region: Region) -> RgbaFrame {
         (region.width * scale).round().max(1.) as u32,
         (region.height * scale).round().max(1.) as u32,
     )
-}
-
-#[derive(Debug, Clone, Args)]
-pub struct SnapshotArgs {
-    /// Frames to compare.
-    #[arg(required = true, value_delimiter = ',', num_args = 1..)]
-    pub at: Vec<String>,
-    #[arg(long, default_value = "_frame_snapshots")]
-    pub dir: PathBuf,
-    /// Accept the current frames as the new snapshots.
-    #[arg(long)]
-    pub update: bool,
-    /// Per channel difference (0-255) that still counts as equal.
-    #[arg(long, default_value_t = 16)]
-    pub threshold: u8,
-    /// Fraction of pixels allowed to differ.
-    #[arg(long, default_value_t = 0.001)]
-    pub max_diff: f64,
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -567,6 +561,7 @@ impl<'r, 'a, 'media: 'a, V: Video + Send + Sync, B: FFramesRenderBackend, A: Arg
                         &mut fallback
                     };
                 Previewer::new(video, &options)
+                    .map(|previewer| previewer.with_svgr_rasterizer(backend.svgr_rasterizer()))
                     .map_err(err)
                     .and_then(|mut previewer| match command {
                         Command::Frame(args) => frame(json, &mut previewer, frame_renderer, args),
@@ -578,9 +573,6 @@ impl<'r, 'a, 'media: 'a, V: Video + Send + Sync, B: FFramesRenderBackend, A: Arg
                         Command::Timeline => timeline(json, &previewer),
                         Command::Inspect(args) => {
                             inspect(json, &mut previewer, frame_renderer, args)
-                        }
-                        Command::Snapshot(args) => {
-                            snapshots(json, &mut previewer, frame_renderer, args)
                         }
                         Command::Audio(args) => audio(json, &previewer, args),
                         Command::Preview(args) => {
@@ -601,7 +593,6 @@ impl<'r, 'a, 'media: 'a, V: Video + Send + Sync, B: FFramesRenderBackend, A: Arg
                                 audio: !args.mute,
                                 backend: args.backend,
                             };
-                            let options = previewer.options().clone();
                             // Fonts and caches of the previewer are not needed by the player.
                             drop(previewer);
                             play(video, &options, &request).map(|()| ExitCode::SUCCESS)
@@ -852,9 +843,26 @@ fn frame<'a, 'm: 'a, V: Video>(
     check_render_size::<V>(scale)?;
     previewer.set_scale(scale);
 
+    let specs = resolve_frames(previewer, &args.at)?;
+    let frames: Vec<usize> = specs.iter().map(|(_, frame)| *frame).collect();
+    let mut rendered = Vec::with_capacity(frames.len());
+    previewer
+        .render_inspected_each(&frames, renderer, |mut pixels, report| {
+            // The labels of `--ids` need the whole frame. Without them only the crop stays in
+            // memory until all frames are done, which is small also at a large zoom.
+            if !args.ids
+                && let Some(crop) = args.crop
+            {
+                pixels = crop_frame::<V>(&pixels, crop);
+            }
+            rendered.push((pixels, report));
+            Ok(())
+        })
+        .map_err(err)?;
+
     let mut results = Vec::new();
-    for (spec, frame) in resolve_frames(previewer, &args.at)? {
-        let (mut pixels, report) = previewer.render_inspected(frame, renderer).map_err(err)?;
+    let mut images = Vec::new();
+    for ((spec, frame), (mut pixels, report)) in specs.into_iter().zip(rendered) {
         let elements = if args.ids {
             let tree = previewer.svg_tree(frame).map_err(err)?;
             let mut elements = element_labels::labelled_elements(&tree);
@@ -878,12 +886,13 @@ fn frame<'a, 'm: 'a, V: Video>(
         } else {
             None
         };
-        if let Some(crop) = args.crop {
+        if args.ids
+            && let Some(crop) = args.crop
+        {
             pixels = crop_frame::<V>(&pixels, crop);
         }
-        let name = snapshot::snapshot_name(&spec);
+        let name = file_name(&spec);
         let path = args.output.join(format!("{name}.png"));
-        pixels.save_png(&path).map_err(err)?;
         let svg = if args.svg {
             let svg_path = args.output.join(format!("{name}.svg"));
             std::fs::write(&svg_path, previewer.svg(frame).map_err(err)?).map_err(err)?;
@@ -891,6 +900,7 @@ fn frame<'a, 'm: 'a, V: Video>(
         } else {
             None
         };
+        images.push(pixels);
         results.push(FrameResult {
             spec,
             path,
@@ -898,6 +908,15 @@ fn frame<'a, 'm: 'a, V: Video>(
             elements,
             report,
         });
+    }
+    // The PNGs encode on several threads.
+    {
+        use rayon::prelude::*;
+        images
+            .par_iter()
+            .zip(&results)
+            .try_for_each(|(pixels, result)| pixels.save_png(&result.path))
+            .map_err(err)?;
     }
 
     print(json, &results, || {
@@ -940,28 +959,30 @@ fn render_cells<'a, 'm: 'a, V: Video>(
 ) -> CliResult<(Vec<sheet::SheetCell>, Vec<FrameReport>)> {
     let mut cells = Vec::new();
     let mut reports = Vec::new();
-    for &frame in frames {
-        let (mut pixels, report) = previewer.render_inspected(frame, renderer).map_err(err)?;
-        if let Some(crop) = crop {
-            pixels = crop_frame::<V>(&pixels, crop);
-        }
-        cells.push(sheet::SheetCell {
-            frame: pixels,
-            label: format!(
-                "{:.2}s  f{}{}",
-                report.seconds,
-                frame,
-                scenes_label(&report.scenes)
-            ),
-        });
-        if report
-            .diagnostics
-            .iter()
-            .any(|d| d.severity > Severity::Info)
-        {
-            reports.push(report);
-        }
-    }
+    previewer
+        .render_inspected_each(frames, renderer, |mut pixels, report| {
+            if let Some(crop) = crop {
+                pixels = crop_frame::<V>(&pixels, crop);
+            }
+            cells.push(sheet::SheetCell {
+                frame: pixels,
+                label: format!(
+                    "{:.2}s  f{}{}",
+                    report.seconds,
+                    report.frame,
+                    scenes_label(&report.scenes)
+                ),
+            });
+            if report
+                .diagnostics
+                .iter()
+                .any(|d| d.severity > Severity::Info)
+            {
+                reports.push(report);
+            }
+            Ok(())
+        })
+        .map_err(err)?;
     Ok((cells, reports))
 }
 
@@ -1188,19 +1209,23 @@ fn scan_pops<'a, 'm: 'a, V: Video>(
     let mut detector = PopDetector::new(width, height);
     let progress = !json && std::io::stderr().is_terminal();
     let total = range.len();
-    for (i, frame) in range.clone().enumerate() {
-        let pixels = previewer.render(frame, renderer).map_err(err)?;
-        if (pixels.width, pixels.height) != (width, height) {
-            return Err(format!(
-                "the renderer returned a {}x{} frame instead of {width}x{height}",
-                pixels.width, pixels.height
-            ));
-        }
-        detector.push(pixels);
-        if progress && i % 30 == 0 {
-            eprint!("\rscanning for pops: frame {i}/{total}");
-        }
-    }
+    let frames: Vec<usize> = range.clone().collect();
+    previewer
+        .render_each(&frames, renderer, |frame, pixels| {
+            if (pixels.width, pixels.height) != (width, height) {
+                return Err(FFramesRendererError::Custom(format!(
+                    "the renderer returned a {}x{} frame instead of {width}x{height}",
+                    pixels.width, pixels.height
+                )));
+            }
+            detector.push(pixels);
+            let i = frame - range.start;
+            if progress && i.is_multiple_of(30) {
+                eprint!("\rscanning for pops: frame {i}/{total}");
+            }
+            Ok(())
+        })
+        .map_err(err)?;
     if progress {
         eprint!("\r{}\r", " ".repeat(48));
     }
@@ -1326,37 +1351,40 @@ fn inspect<'a, 'm: 'a, V: Video>(
     frames.dedup();
 
     let mut findings: Vec<Finding> = Vec::new();
-    for &frame in &frames {
-        let report = previewer.inspect(frame).map_err(err)?;
-        for diagnostic in report.diagnostics {
-            if diagnostic.severity == Severity::Info && !args.info {
-                continue;
-            }
-            match findings.iter_mut().find(|f| f.key == diagnostic.key) {
-                Some(finding) => {
-                    finding.last_frame = frame;
-                    finding.last_seconds = report.seconds;
-                    finding.frames += 1;
-                    for scene in &report.scenes {
-                        if !finding.scenes.contains(scene) {
-                            finding.scenes.push(scene.clone());
+    previewer
+        .inspect_each(&frames, |report| {
+            let frame = report.frame;
+            for diagnostic in report.diagnostics {
+                if diagnostic.severity == Severity::Info && !args.info {
+                    continue;
+                }
+                match findings.iter_mut().find(|f| f.key == diagnostic.key) {
+                    Some(finding) => {
+                        finding.last_frame = frame;
+                        finding.last_seconds = report.seconds;
+                        finding.frames += 1;
+                        for scene in &report.scenes {
+                            if !finding.scenes.contains(scene) {
+                                finding.scenes.push(scene.clone());
+                            }
                         }
                     }
+                    None => findings.push(Finding {
+                        severity: diagnostic.severity,
+                        key: diagnostic.key,
+                        message: diagnostic.message,
+                        first_frame: frame,
+                        last_frame: frame,
+                        first_seconds: report.seconds,
+                        last_seconds: report.seconds,
+                        frames: 1,
+                        scenes: report.scenes.clone(),
+                    }),
                 }
-                None => findings.push(Finding {
-                    severity: diagnostic.severity,
-                    key: diagnostic.key,
-                    message: diagnostic.message,
-                    first_frame: frame,
-                    last_frame: frame,
-                    first_seconds: report.seconds,
-                    last_seconds: report.seconds,
-                    frames: 1,
-                    scenes: report.scenes.clone(),
-                }),
             }
-        }
-    }
+            Ok(())
+        })
+        .map_err(err)?;
     let pop_scanned_frames = if args.pops {
         findings.extend(scan_pops(json, previewer, renderer, range.clone())?);
         Some(range.len())
@@ -1408,52 +1436,6 @@ fn inspect<'a, 'm: 'a, V: Video>(
         text
     });
 
-    Ok(if failed {
-        ExitCode::from(2)
-    } else {
-        ExitCode::SUCCESS
-    })
-}
-
-fn snapshots<'a, 'm: 'a, V: Video>(
-    json: bool,
-    previewer: &mut Previewer<'a, 'm, V>,
-    renderer: &mut dyn FrameRenderer,
-    args: SnapshotArgs,
-) -> CliResult {
-    let options = snapshot::SnapshotOptions {
-        directory: args.dir,
-        channel_threshold: args.threshold,
-        max_diff_ratio: args.max_diff,
-        update: args.update || snapshot::SnapshotOptions::default().update,
-    };
-    let mut results = Vec::new();
-    for spec in args.at.iter().flat_map(|s| s.split_whitespace()) {
-        results.push(snapshot::check_frame(previewer, renderer, spec, &options).map_err(err)?);
-    }
-    let failed = results
-        .iter()
-        .any(|r| r.status == snapshot::SnapshotStatus::Failed);
-
-    print(json, &results, || {
-        results
-            .iter()
-            .map(|r| {
-                let mut line = format!("{:?} {} (frame {})", r.status, r.spec, r.frame);
-                if r.status == snapshot::SnapshotStatus::Failed {
-                    let _ = write!(
-                        line,
-                        ": {:.3}% of pixels differ, actual {}, diff {}",
-                        r.diff_ratio * 100.,
-                        r.actual.as_deref().unwrap_or(Path::new("-")).display(),
-                        r.diff.as_deref().unwrap_or(Path::new("-")).display()
-                    );
-                }
-                line
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-    });
     Ok(if failed {
         ExitCode::from(2)
     } else {
@@ -1824,6 +1806,13 @@ fn waveform_image<'a, 'm: 'a, V: Video>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_names_are_safe() {
+        assert_eq!(file_name("Intro@1.5s"), "intro_1.5s");
+        assert_eq!(file_name("50%"), "50p");
+        assert_eq!(file_name("#3"), "3");
+    }
 
     #[test]
     fn spread_includes_both_ends() {
