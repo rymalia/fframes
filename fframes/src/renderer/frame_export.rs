@@ -23,6 +23,53 @@ unsafe impl Send for AvBuffer {}
 unsafe impl Sync for AvBuffer {}
 
 impl AvBuffer {
+    /// Wraps external storage in a libav buffer. On success, libav calls `free` with a
+    /// null opaque pointer when the last reference is dropped. On failure the caller
+    /// retains ownership of the storage.
+    ///
+    /// # Safety
+    /// `data` must remain valid for `size` bytes until `free` is called.
+    /// The callback must be safe to run on whichever thread drops the final reference.
+    #[inline(never)]
+    pub unsafe fn from_external(
+        data: *mut u8,
+        size: usize,
+        free: unsafe extern "C" fn(*mut std::ffi::c_void, *mut u8),
+    ) -> Option<Self> {
+        unsafe {
+            Self::from_raw(av_buffer_create(
+                data,
+                size,
+                Some(free),
+                std::ptr::null_mut(),
+                0,
+            ))
+        }
+    }
+
+    /// Transfers this reference to a libav owner, such as an `AVFrame::buf` slot.
+    pub fn into_raw(self) -> *mut AVBufferRef {
+        std::mem::ManuallyDrop::new(self).as_ptr()
+    }
+
+    // The generic hardware_frames caller can live in the video executable. Keep
+    // libav's native calls inside the engine that links libav.
+    #[inline(never)]
+    fn allocate_hw_frames(&self) -> RenderEncodingResult<Self> {
+        unsafe { Self::from_raw(av_hwframe_ctx_alloc(self.as_ptr())) }
+            .ok_or_else(|| RenderEncodingError::CantAllocate("hardware frames".to_owned()))
+    }
+
+    #[inline(never)]
+    fn init_hw_frames(&self) -> RenderEncodingResult<()> {
+        let status = unsafe { av_hwframe_ctx_init(self.as_ptr()) };
+        if status < 0 {
+            Err(ffmpeg_error(status))
+        } else {
+            Ok(())
+        }
+    }
+
     /// Takes ownership of `buffer`, `None` when it is null.
     ///
     /// # Safety
@@ -378,8 +425,7 @@ impl EncoderInput {
         configure: impl FnOnce(&mut AVHWFramesContext),
     ) -> RenderEncodingResult<Self> {
         unsafe {
-            let frames = AvBuffer::from_raw(av_hwframe_ctx_alloc(device.as_ptr()))
-                .ok_or_else(|| RenderEncodingError::CantAllocate("hardware frames".to_owned()))?;
+            let frames = device.allocate_hw_frames()?;
 
             let context = &mut *frames.data::<AVHWFramesContext>();
             context.format = format;
@@ -388,10 +434,7 @@ impl EncoderInput {
             context.height = height;
             configure(context);
 
-            let status = av_hwframe_ctx_init(frames.as_ptr());
-            if status < 0 {
-                return Err(ffmpeg_error(status));
-            }
+            frames.init_hw_frames()?;
 
             Ok(Self {
                 pixel_format: format,
@@ -570,12 +613,14 @@ impl Drop for FramePool {
     }
 }
 
-/// Converts RGBA8 pixels into frames of a software pixel format on the CPU: the built-in
-/// SIMD converter for yuv420p, swscale for every other format.
+/// Converts premultiplied RGBA8 pixels into frames of a software pixel format on the CPU:
+/// the built-in SIMD converter for yuv420p, swscale for every other format. Alpha formats
+/// receive straight colors; formats without alpha keep the colors composited over black.
 pub struct RgbaFrameConverter {
     pool: FramePool,
     sws: *mut SwsContext,
     matrix: YuvMatrix,
+    straight_rgba: Option<Vec<u8>>,
 }
 
 unsafe impl Send for RgbaFrameConverter {}
@@ -629,7 +674,13 @@ impl RgbaFrameConverter {
             sws
         };
 
-        Ok(Self { pool, sws, matrix })
+        Ok(Self {
+            pool,
+            sws,
+            matrix,
+            straight_rgba: (pixel_format_flags(format) & AV_PIX_FMT_FLAG_ALPHA as u64 != 0)
+                .then(Vec::new),
+        })
     }
 
     /// For the frames `input` asks for.
@@ -637,15 +688,42 @@ impl RgbaFrameConverter {
         Self::with_matrix(input.pixel_format, input.color_matrix, width, height)
     }
 
-    /// `rgba` is `width * height * 4` bytes without line padding.
+    /// `rgba` is premultiplied, with `width * height * 4` bytes without line padding.
     pub fn convert(&mut self, rgba: &[u8]) -> RenderEncodingResult<VideoFrame> {
+        self.convert_pixels(rgba, true)
+    }
+
+    fn convert_pixels(
+        &mut self,
+        rgba: &[u8],
+        premultiplied: bool,
+    ) -> RenderEncodingResult<VideoFrame> {
         let (width, height) = (self.pool.width, self.pool.height);
-        if rgba.len() < width as usize * height as usize * 4 {
+        let byte_len = width as usize * height as usize * 4;
+        if rgba.len() < byte_len {
             return Err(RenderEncodingError::Internal(format!(
                 "{} bytes of RGBA do not make a {width}x{height} frame",
                 rgba.len()
             )));
         }
+
+        // swscale reads RGBA as straight colors. Only undo premultiplication when the
+        // destination retains alpha, using scratch storage so the caller's pixels survive.
+        let rgba = if premultiplied && let Some(straight) = &mut self.straight_rgba {
+            straight.clear();
+            straight.extend_from_slice(&rgba[..byte_len]);
+            for pixel in straight.as_chunks_mut::<4>().0 {
+                let alpha = u32::from(pixel[3]);
+                if alpha != 0 && alpha != 255 {
+                    for channel in &mut pixel[..3] {
+                        *channel = ((u32::from(*channel) * 255 + alpha / 2) / alpha).min(255) as u8;
+                    }
+                }
+            }
+            straight.as_slice()
+        } else {
+            rgba
+        };
 
         let frame = self.pool.get()?;
         unsafe {
@@ -791,7 +869,28 @@ impl<R: FrameRenderer> EncoderFrameRenderer for RgbaEncoderFrameRenderer<R> {
             .render_tree(tree, background, self.width, self.height)?;
 
         self.converter
-            .convert(&frame.pixels)
+            // FrameRenderer already returns straight RGBA, unlike the native rasterizers.
+            .convert_pixels(&frame.pixels, false)
             .map_err(|err| FFramesRendererError::from_chunk(0, err))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn frame_releases_external_storage_after_its_last_reference() {
+        unsafe extern "C" fn release(_opaque: *mut std::ffi::c_void, data: *mut u8) {
+            unsafe { *data += 1 };
+        }
+        let mut releases = 0_u8;
+        let buffer = unsafe { AvBuffer::from_external(&raw mut releases, 1, release) }.unwrap();
+        let frame = VideoFrame::empty().unwrap();
+        unsafe { (*frame.as_ptr()).buf[0] = buffer.clone().into_raw() };
+        drop(buffer);
+        assert_eq!(releases, 0);
+        drop(frame);
+        assert_eq!(releases, 1);
     }
 }

@@ -359,7 +359,7 @@ Rules for `render_frame`:
 
 - It runs once per frame on several threads. No panics, no I/O, no heavy allocation. Precompute
   in the constructor and read from `self`; memoise per-video data in a `std::sync::OnceLock`
-  field (only store a measurement once it succeeded, see `examples/motion-graphics`).
+  field (only store a measurement once it succeeded).
 - `svgr!` is SVG with Rust interpolation: attributes and text children accept `{expr}` where
   `expr` is a string, number, `Color`, `Transform`, another `Svgr`, or an iterator of `Svgr`
   (`.collect::<Vec<_>>()`). Comments are `// ...` lines inside the markup.
@@ -472,9 +472,22 @@ lets scenes cross-fade; `ctx.get_scene_info(&scene)` gives the resolved frame ra
 let Some(video_frame) = frame.get_synced_video_frame(ctx, "clip.mp4", &fframes::SyncVideoFrameInput {
     start_from: 0.,
     looping: false,
+    speed: 1.5, // 1.5x from start_from on; 0.5 for slow motion, default 1.0
     editor_fallback_image: ctx.get_image("clip_poster.jpg"),
 }) else { return Svgr::empty() };
 let image = video_frame.into_image(); // <image href={image.href()} .../>
+
+// A part of a file (footage): seconds 19.2..24.7 of the file (`0.0..` to its end), from
+// second 1.2 of the scene (`.at`, default 0). `.speed(1.5)`, `.reverse()`, `.looping()`. Each clip has its own decoder,
+// so a clip and a picture in picture of the same file do not slow each other down. Store clips
+// in the scene, `duration` = `clip.duration()`. The clip gives an image of the current frame:
+// draw it with your own size, crop, transform, filter, mask, or pass it to a shader.
+let plan = fframes::Clip::new("screen.mov", 19.2..24.7).at(1.2).editor_fallback_image(ctx.get_image("poster.jpg"));
+let pip = plan.image_at_width(&frame, ctx, 440).map(|image| svgr!( // decoded at the shown size
+    <image href={image.href()} x="580" y="1180" width="440" height="660" preserveAspectRatio="xMidYMid slice" />
+)); // `{pip}` in svgr!: an Option<Svgr> is nothing when None
+// One frame of a file (a freeze frame): seconds of the file, not of the timeline.
+let still = frame.video_frame_at(ctx, "IMG_0926.mov", 21.0, None);
 
 // Audio spectrum for the current frame (see examples/audio-announce).
 let bars = frame.visualize_audio_frame(fframes::VisualizeFrameInput {
@@ -690,7 +703,7 @@ With `fframes = { features = ["lottie"] }`, a Lottie `.json` file is media like 
 into the `include_media_dir!` folder or a `MediaDirectory` folder and play it by name.
 [velato](https://github.com/linebender/velato) reads and evaluates the file. fframes draws each
 frame as `svgr!` vector graphics, on every backend and in the editor. See
-`examples/lottie-launch`.
+`examples/lottie`.
 
 ```rust
 use fframes::LottieOptions;

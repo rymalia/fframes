@@ -1,7 +1,7 @@
 // Renders key frames of every example through its command line with one renderer and compares
 // them with odiff to e2e/snapshots, which every renderer has to match. Frames and diffs of the
 // run go to target/e2e/<renderer>.
-//   node scripts/e2e.mjs cpu|skia-cpu|gpu [--update]
+//   node scripts/e2e.mjs cpu|skia-cpu|gpu [--update] [--example name]
 import { spawnSync } from "node:child_process";
 import {
   copyFileSync,
@@ -14,11 +14,21 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { compare } from "odiff-bin";
 
-const [renderer, flag] = process.argv.slice(2);
-const update = flag === "--update";
-if (!["cpu", "skia-cpu", "gpu"].includes(renderer) || (flag && !update)) {
-  console.error("usage: node scripts/e2e.mjs cpu|skia-cpu|gpu [--update]");
+const [renderer, ...flags] = process.argv.slice(2);
+let update = false;
+let selectedExample;
+const usage = () => {
+  console.error(
+    "usage: node scripts/e2e.mjs cpu|skia-cpu|gpu [--update] [--example name]"
+  );
   process.exit(1);
+};
+if (!["cpu", "skia-cpu", "gpu"].includes(renderer)) usage();
+for (let i = 0; i < flags.length; i++) {
+  if (flags[i] === "--update") update = true;
+  else if (flags[i] === "--example" && flags[i + 1] && !selectedExample)
+    selectedExample = flags[++i];
+  else usage();
 }
 
 // Renderers resample images and round colours differently: odiff's colour threshold 0.15
@@ -34,18 +44,20 @@ const out = join(target, "e2e", renderer);
 // `skia`: shaders, which the CPU renderer (tiny-skia) does not run. shader-mode is not here: its
 // media is kept outside Git.
 // prettier-ignore
-const examples = [
+const allExamples = [
+  { dir: "anamorphic-video", pkg: "anamorphic-video", bin: "anamorphic-video", frames: "50%" },
   { dir: "audio-announce", pkg: "audio-announce-example", bin: "audio_announce_example_bin", frames: "5s,30s" },
   { dir: "beta", pkg: "beta-example", bin: "beta_example_bin", frames: "CodeDemoScene@50%,IphoneScene@50%,BetaExamples@50%" },
+  // Preset layouts, typed highlights, wrapping and simultaneous cues.
+  { dir: "captions", pkg: "captions-example", bin: "captions-example", frames: "1.5s,5.2s,7s" },
   { dir: "conference-splash-screen", pkg: "conference-splash-screen-example", bin: "conference_splash_screen_bin", frames: "SponsorScene@50%,SpeakerScene@50%" },
   { dir: "fframes-intro", pkg: "fframes-intro", bin: "fframes-intro", frames: "CodeScene@50%,ShaderScene@2.6s,BenchmarkScene@12.4s,OutroScene@7s", skia: true },
   { dir: "hello-world", pkg: "hello-world-example", bin: "hello_world_example_bin", frames: "5s,20s" },
   { dir: "low-poly-art", pkg: "low-poly-art-example", bin: "low_poly_art_example_bin", frames: "Owl@3s,Owl@8s" },
   // tiger.json at four points of its loop: crouching, the take-off, in the air, landing
-  { dir: "lottie-launch", pkg: "lottie-launch", bin: "lottie-launch", frames: "Code@2s,Code@3.5s,Code@3.7s,Code@3.9s" },
+  { dir: "lottie", pkg: "lottie", bin: "lottie", frames: "Code@2s,Code@3.5s,Code@3.7s,Code@3.9s" },
   { dir: "made-of-motion", pkg: "made-of-motion", bin: "made-of-motion", frames: "Portrait@50%,Orbit@50%,Fframes@50%", skia: true },
   { dir: "marketing", pkg: "marketing-example", bin: "marketing-example", frames: "3s,10s,18s" },
-  { dir: "motion-graphics", pkg: "motion-graphics-example", bin: "motion_graphics_example_bin", frames: "1s,3s" },
   { dir: "neon-triangle", pkg: "neon-triangle-example", bin: "neon_triangle_example_bin", frames: "2s,4s", skia: true },
   { dir: "pixel-memory", pkg: "pixel-example", bin: "pixel_memory_example_bin", frames: "StartScene@1.2s,ParallaxGridPhotos[0]@7s,SinglePhotoFloat[0]@50%,SpiralHeapGallery@50%", args: ["--song", "revenge.mp3", "--seed", "48"] },
   { dir: "podcast", pkg: "podcast-example", bin: "podcast_example_bin", frames: "10s,40s" },
@@ -54,6 +66,18 @@ const examples = [
   { dir: "teej-podcast", pkg: "teej_podcast_example", bin: "teej_podcast_example_bin", frames: "10s,2:00" },
   { dir: "tiktok", pkg: "tiktok-example", bin: "tiktok_example_bin", frames: "10s,30s" },
 ];
+
+const examples = allExamples.filter(
+  ({ dir }) => !selectedExample || dir === selectedExample
+);
+if (!examples.length) {
+  console.error(`unknown example: ${selectedExample}`);
+  process.exit(1);
+}
+if (selectedExample && renderer === "cpu" && examples[0].skia) {
+  console.error(`${selectedExample} requires skia-cpu or gpu`);
+  process.exit(1);
+}
 
 const run = (command, args, cwd) =>
   spawnSync(command, args, { cwd, stdio: ["ignore", "ignore", "inherit"] })
@@ -65,7 +89,10 @@ const build = ["build", "--release", "--bins", ...packages];
 if (spawnSync("cargo", build, { cwd: root, stdio: "inherit" }).status !== 0)
   process.exit(1);
 
-rmSync(out, { recursive: true, force: true });
+rmSync(selectedExample ? join(out, selectedExample) : out, {
+  recursive: true,
+  force: true,
+});
 const failed = [];
 const created = [];
 for (const { dir, bin, frames, skia, args = [] } of examples) {
